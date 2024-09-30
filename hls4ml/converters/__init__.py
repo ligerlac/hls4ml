@@ -61,7 +61,7 @@ for model_type in model_types:
                             register_onnx_layer_handler(layer, func)
 
         except ImportError as err:
-            print(f'WARNING: Failed to import handlers from {module}: {err.msg}.')
+            warnings.warn(f'WARNING: Failed to import handlers from {module}: {err.msg}.', stacklevel=1)
             continue
 
 
