@@ -7,6 +7,7 @@ namespace nnet {
 
 struct merge_config {
     static const unsigned n_elem = 10;
+    static const unsigned reuse_factor = 1;
 };
 
 struct dot_config {
@@ -220,7 +221,7 @@ void concatenate3d_2(input1_T data1[CONFIG_T::n_elem1_0 * CONFIG_T::n_elem1_1 * 
             }
 
             #pragma unroll
-            for (int k = 0; k < CONFIG_T::n_elem1_2; k++) {
+            for (int k = 0; k < CONFIG_T::n_elem2_2; k++) {
                 int res_idx = i * CONFIG_T::n_elem1_1 * (CONFIG_T::n_elem1_2 + CONFIG_T::n_elem2_2) +
                               j * (CONFIG_T::n_elem1_2 + CONFIG_T::n_elem2_2) + k + CONFIG_T::n_elem1_2;
                 int data_idx = i * CONFIG_T::n_elem2_1 * CONFIG_T::n_elem2_2 + j * CONFIG_T::n_elem2_2 + k;

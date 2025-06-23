@@ -10,9 +10,11 @@ from hls4ml.backends import get_backend
 from hls4ml.model.flow import get_flow
 from hls4ml.model.layers import layer_map
 from hls4ml.model.optimizer import get_available_passes, optimize_model
+from hls4ml.model.types import Serializable
+from hls4ml.utils.string_utils import convert_to_snake_case
 
 
-class HLSConfig:
+class HLSConfig(Serializable):
     """The configuration class as stored in the ModelGraph.
 
     Args:
@@ -35,7 +37,7 @@ class HLSConfig:
         self.layer_type_targ_cycles = {}
         self.layer_name_targ_cycles = {}
 
-        self.model_strategy = 'Latency'
+        self.model_strategy = convert_to_snake_case('Latency')
         self.layer_type_strategy = {}
         self.layer_name_strategy = {}
 
@@ -49,7 +51,8 @@ class HLSConfig:
 
         self.trace_output = self.get_config_value('TraceOutput', False)
 
-        self.pipeline_style = 'pipeline'
+        self.pipeline_style = 'auto'
+        self.pipeline_ii = None
 
         if 'WriterConfig' in self.config:
             self.writer_config = self.config['WriterConfig']
@@ -58,10 +61,10 @@ class HLSConfig:
                 'Namespace': None,
                 'WriteWeightsTxt': True,
                 'WriteTar': False,
+                'TBOutputStream': 'both',
             }
 
         self._parse_hls_config()
-        self._validate_hls_config()
 
     def get_config_value(self, key, default=None):
         return self.config.get(key, default)
@@ -120,7 +123,8 @@ class HLSConfig:
         type_name = layer.name.lower() + '_' + var + '_t'
         if precision is None:
             precision = self.layer_name_precision.get(layer.name.lower() + '_default')
-            type_name = layer.name.lower() + '_default_t'
+            # I think it is better to keep these unique still to avoid inadvertent updates
+            # type_name = layer.name.lower() + '_default_t'
 
         if precision is None:
             precision = self.layer_type_precision.get(layer.class_name.lower() + '_' + var)
@@ -217,7 +221,7 @@ class HLSConfig:
 
         strategy = layer_cfg.get('Strategy')
         if strategy is not None:
-            self.layer_name_strategy[layer_name.lower()] = strategy
+            self.layer_name_strategy[layer_name.lower()] = convert_to_snake_case(strategy)
 
         conv_implementation = layer_cfg.get('ConvImplementation')
         if conv_implementation is not None:
@@ -265,9 +269,10 @@ class HLSConfig:
             self.model_rf = model_cfg.get('ReuseFactor')
             self.model_targ_cycles = model_cfg.get('TargetCycles')
             self.model_conv_implementation = model_cfg.get('ConvImplementation', 'LineBuffer')
-            self.model_strategy = model_cfg.get('Strategy', 'Latency')
+            self.model_strategy = convert_to_snake_case(model_cfg.get('Strategy', 'Latency'))
             self.model_compression = bool(model_cfg.get('Compression', 0))
-            self.pipeline_style = model_cfg.get('PipelineStyle', 'pipeline')
+            self.pipeline_style = model_cfg.get('PipelineStyle', 'auto')
+            self.pipeline_ii = model_cfg.get('PipelineInterval', None)
 
         layer_type_cfg = hls_config.get('LayerType')
         if layer_type_cfg is not None:
@@ -289,7 +294,7 @@ class HLSConfig:
 
                 strategy = layer_cfg.get('Strategy')
                 if strategy is not None:
-                    self.layer_type_strategy[layer_type.lower()] = strategy
+                    self.layer_type_strategy[layer_type.lower()] = convert_to_snake_case(strategy)
 
                 conv_implementation = layer_cfg.get('ConvImplementation')
                 if conv_implementation is not None:
@@ -304,52 +309,90 @@ class HLSConfig:
             for layer_name, layer_cfg in layer_name_cfg.items():
                 self.parse_name_config(layer_name, layer_cfg)
 
-    def _validate_hls_config(self):
-        use_dataflow = False
-        if self.pipeline_style.lower() == 'pipeline' and self.model_compression:
-            print('WARNING: Compression enabled while pipeline style set to "pipeline".')
-            use_dataflow = True
-        for layer_type, strategy in self.layer_type_strategy.items():
-            if strategy.lower() == 'resource' and self.pipeline_style.lower() == 'pipeline':
-                print(
-                    'WARNING: Strategy for layer type {} set to "Resource", while pipeline style set to "pipeline".'.format(
-                        layer_type
-                    )
-                )
-                use_dataflow = True
+    def serialize(self):
+        state = {}
 
-        for layer_name, strategy in self.layer_name_strategy.items():
-            if strategy.lower() == 'resource' and self.pipeline_style.lower() == 'pipeline':
-                print(
-                    'WARNING: Strategy for layer {} set to "Resource", while pipeline style set to "pipeline".'.format(
-                        layer_name
-                    )
-                )
-                use_dataflow = True
+        config = self.config.copy()
+        config.pop('KerasModel', None)
+        config.pop('OnnxModel', None)
+        config.pop('PytorchModel', None)
 
-        for layer_type, compression in self.layer_type_compression.items():
-            if compression and self.pipeline_style.lower() == 'pipeline':
-                print(
-                    'WARNING: Compression enabled for layer type {}, while pipeline style set to "pipeline".'.format(
-                        layer_type
-                    )
-                )
-                use_dataflow = True
+        # Much of this may not be needed and is already in 'config' dict but is kept here to be sure
+        state['config'] = config
+        state['model_precision'] = self.model_precision.copy()
+        state['layer_type_precision'] = self.layer_type_precision.copy()
+        state['layer_name_precision'] = self.layer_name_precision.copy()
 
-        for layer_name, compression in self.layer_name_compression.items():
-            if compression and self.pipeline_style.lower() == 'pipeline':
-                print(f'WARNING: Compression enabled for layer {layer_name}, while pipeline style set to "pipeline".')
-                use_dataflow = True
+        state['model_rf'] = self.model_rf
+        state['layer_type_rf'] = self.layer_type_rf.copy()
+        state['layer_name_rf'] = self.layer_name_rf.copy()
 
-        if self.model_strategy.lower() == 'resource':
-            use_dataflow = True
+        state['model_targ_cycles'] = self.model_targ_cycles
+        state['layer_type_targ_cycles'] = self.layer_type_targ_cycles.copy()
+        state['layer_name_targ_cycles'] = self.layer_name_targ_cycles.copy()
 
-        if use_dataflow:
-            print('WARNING: Changing pipeline style to "dataflow".')
-            self.pipeline_style = 'dataflow'
+        state['model_strategy'] = self.model_strategy
+        state['layer_type_strategy'] = self.layer_type_strategy.copy()
+        state['layer_name_strategy'] = self.layer_name_strategy.copy()
+
+        state['model_conv_implementation'] = self.model_conv_implementation
+        state['layer_type_conv_implementation'] = self.layer_type_conv_implementation.copy()
+        state['layer_name_conv_implementation'] = self.layer_name_conv_implementation.copy()
+
+        state['model_compression'] = self.model_compression
+        state['layer_type_compression'] = self.layer_type_compression.copy()
+        state['layer_name_compression'] = self.layer_name_compression.copy()
+
+        state['trace_output'] = self.trace_output
+        state['pipeline_style'] = self.pipeline_style
+        state['pipeline_ii'] = self.pipeline_ii
+        state['writer_config'] = self.writer_config.copy()
+        state['flows'] = self.flows.copy()
+        state['optimizers'] = self.optimizers.copy() if self.optimizers is not None else None
+        state['model_bf'] = self.model_bf
+
+        return state
+
+    @classmethod
+    def deserialize(cls, state):
+        config = cls(state['config'])
+
+        config.model_precision = state['model_precision']
+        config.layer_type_precision = state['layer_type_precision']
+        config.layer_name_precision = state['layer_name_precision']
+
+        config.model_rf = state['model_rf']
+        config.layer_type_rf = state['layer_type_rf']
+        config.layer_name_rf = state['layer_name_rf']
+
+        config.model_targ_cycles = state['model_targ_cycles']
+        config.layer_type_targ_cycles = state['layer_type_targ_cycles']
+        config.layer_name_targ_cycles = state['layer_name_targ_cycles']
+
+        config.model_strategy = state['model_strategy']
+        config.layer_type_strategy = state['layer_type_strategy']
+        config.layer_name_strategy = state['layer_name_strategy']
+
+        config.model_conv_implementation = state['model_conv_implementation']
+        config.layer_type_conv_implementation = state['layer_type_conv_implementation']
+        config.layer_name_conv_implementation = state['layer_name_conv_implementation']
+
+        config.model_compression = state['model_compression']
+        config.layer_type_compression = state['layer_type_compression']
+        config.layer_name_compression = state['layer_name_compression']
+
+        config.trace_output = state['trace_output']
+        config.pipeline_style = state['pipeline_style']
+        config.pipeline_ii = state['pipeline_ii']
+        config.writer_config = state['writer_config']
+        config.flows = state['flows']
+        config.optimizers = state['optimizers']
+        config.model_bf = state['model_bf']
+
+        return config
 
 
-class ModelGraph:
+class ModelGraph(Serializable):
     """The ModelGraph represents the network that is being processed by hls4ml.
 
     Args:
@@ -359,46 +402,64 @@ class ModelGraph:
         outputs (list, optional):  The outputs to the model. If None, determined from layer_list
     """
 
-    def __init__(self, config, layer_list, inputs=None, outputs=None):
-        self.config = HLSConfig(config)
+    def __init__(self, config, inputs=None, outputs=None):
+        self.config = config
+        self.inputs = inputs
+        self.outputs = outputs
+        self.graph = OrderedDict()
+        self._applied_flows = []  # keep track of the applied flows
+        self.index = 0
+        self.output_vars = {}
+        self._top_function_lib = None
 
-        # keep track of the applied flows
-        self._applied_flows = []
+    @classmethod
+    def from_layer_list(cls, config_dict, layer_list, inputs=None, outputs=None):
+        def _find_output_variable_names(layer_list, layer_names):
+            """Given a list of all layers, and a list input/output names, find the names of their outputs that will be used
+            as the name of the output variables."""
+            inout_nodes = []
+            for layer_name in layer_names:
+                for node in layer_list:
+                    if node['name'] == layer_name:
+                        inout_nodes.append(node)
+            all_node_output_names = [node['outputs'] if 'outputs' in node else [node['name']] for node in inout_nodes]
+            return [output for node_output_names in all_node_output_names for output in node_output_names]  # to flatten
+
+        config = HLSConfig(config_dict)
 
         # If not provided, assumes layer_list[0] is the input layer, and layer_list[-1] is output layer
-
         # Note, these are actually the variable names, which may differ from the layer name
         input_layers = inputs if inputs is not None else [layer_list[0]['name']]
         output_layers = outputs if outputs is not None else [layer_list[-1]['name']]
-        self.inputs = self._find_output_variable_names(layer_list, input_layers)
-        if self.inputs != input_layers:
+        input_names = _find_output_variable_names(layer_list, input_layers)
+        if input_names != input_layers:
             raise RuntimeError(
                 "Currently only support the case when input variables and input layer names match\n"
-                + f"Input layers = {input_layers}, input_vars = {self.inputs}"
+                + f"Input layers = {input_layers}, input_vars = {input_names}"
             )
-        self.outputs = self._find_output_variable_names(layer_list, output_layers)
+        output_names = _find_output_variable_names(layer_list, output_layers)
 
-        self.index = 0
-        self.graph = OrderedDict()  # where the nodes are stored
-        self.output_vars = {}
+        model = cls(config, input_names, output_names)
+        model._make_graph(layer_list)
+        for flow in model.config.flows:
+            model.apply_flow(flow)
 
-        self._top_function_lib = None
+        model.config.config['InputShapes'] = {}
+        for input_var in model.get_input_variables():
+            model.config.config['InputShapes'][input_var.name] = list(input_var.shape)
+        model.config.config['OutputShapes'] = {}
+        for output_var in model.get_output_variables():
+            model.config.config['OutputShapes'][output_var.name] = list(output_var.shape)
 
-        self._make_graph(layer_list)
+        return model
 
-        for flow in self.config.flows:
-            self.apply_flow(flow)
+    @classmethod
+    def from_saved_state(cls, config, graph_state_dict):
+        model = cls(config, graph_state_dict['inputs'], graph_state_dict['outputs'])
+        model._applied_flows = graph_state_dict['applied_flows']
+        model.index = graph_state_dict['index']
 
-    def _find_output_variable_names(self, layer_list, layer_names):
-        """Given a list of all layers, and a list input/output names, find the names of their outputs that will be used
-        as the name of the output variables."""
-        inout_nodes = []
-        for layer_name in layer_names:
-            for node in layer_list:
-                if node['name'] == layer_name:
-                    inout_nodes.append(node)
-        all_node_output_names = [node['outputs'] if 'outputs' in node else [node['name']] for node in inout_nodes]
-        return [output for node_output_names in all_node_output_names for output in node_output_names]  # to flatten
+        return model
 
     def _make_graph(self, layer_list):
         for layer in layer_list:
@@ -466,7 +527,7 @@ class ModelGraph:
             applied_passes = set()
         applied_flows[flow.name] = applied_passes
 
-    def make_node(self, kind, name, attributes, inputs, outputs=None):
+    def make_node(self, kind, name, attributes, inputs, outputs=None, initialize=True):
         """Make a new node not connected to the model graph.
 
         The 'kind' should be a valid layer registered with `register_layer`. If no outputs
@@ -480,6 +541,8 @@ class ModelGraph:
             attributes (dict): Initial set of attributes required to construct the node (Layer)
             inputs (list): List of inputs to the layer
             outputs (list, optional): The optional list of named outputs of the node
+            initialize (bool, optional): Whether to call the `initialize()` of a layer. Defaults to True.
+                Set to False during deserialization.
 
         Raises:
             Exception: If an attempt to insert a node with multiple inputs is made or if
@@ -500,7 +563,7 @@ class ModelGraph:
 
         if self.config.backend is not None:
             layer_cls = self.config.backend.create_layer_class(layer_cls)
-        node = layer_cls(self, name, attributes, inputs, outputs)
+        node = layer_cls(self, name, attributes, inputs, outputs, initialize)
         for o in node.outputs:
             out_var = node.get_output_variable(output_name=o)
             if len(self.outputs) == 1 and o in self.outputs:
@@ -535,7 +598,7 @@ class ModelGraph:
                 next_nodes.append(x)
 
         if before is None:
-            next_node = next((x for x in self.graph.values() if x.inputs[0] in prev_node.outputs), None)
+            next_node = next((x for x in self.graph.values() if x.inputs and x.inputs[0] in prev_node.outputs), None)
         else:
             if before not in next_nodes:
                 raise Exception(
@@ -547,6 +610,8 @@ class ModelGraph:
 
         if next_node is not None:
             next_node.inputs[input_idx] = node.outputs[0]
+        else:
+            self.outputs = [node.outputs[0] if name == prev_node.outputs[0] else name for name in self.outputs]
 
         new_graph = OrderedDict()
         for k, v in self.graph.items():
@@ -555,47 +620,53 @@ class ModelGraph:
                 new_graph[node.name] = node
 
         self.graph = new_graph
-        self._update_model_outputs()
 
-    def remove_node(self, node, rewire=True):
-        """Remove a node from a graph.
+    def remove_node(self, node):
+        """Removes a node from the graph.
 
-        By default, this function can connect the outputs of previous node to the input of next one.
-        Note that when removing a leaf node `rewire` should be set to `False`.
+        By default, this function connects the outputs of the previous
+        node to the inputs of the next node. If the removed node has multiple
+        input/output tensors, an exception is raised.
 
         Args:
-            node (Layer): The node to remove
-            rewire (bool, optional): If `True`, connects the outputs of the previous node
-                to the inputs of the next node
+            node (Layer): The node to remove.
 
         Raises:
-            Exception: If an attempt is made to rewire a leaf node or a node with multiple
-                inputs/outputs.
-
+            Exception: If an attempt is made to remove a node with
+            multiple inputs/outputs.
         """
-        if rewire:
-            inputs = [inp for inp in node.inputs if inp]
-            outputs = [outp for outp in node.outputs if outp]
-            if len(inputs) > 1 or len(outputs) > 1:
-                raise Exception('Cannot rewire a node with multiple inputs/outputs')
-            prev_node = node.get_input_node(node.inputs[0])
+
+        inputs = [inp for inp in node.inputs if inp]
+        outputs = [outp for outp in node.outputs if outp]
+
+        if len(inputs) > 1 or len(outputs) > 1:
+            raise Exception('Cannot delete a node with multiple inputs/outputs')
+
+        if len(outputs) == 1 and len(inputs) == 1:
+
+            # Connect inputs -> $outputs
+            if node.outputs[0] in self.outputs:
+                msg = f'Remove leaf node {node.name} will connect its input node {inputs[0]} to output, but it already is.'
+                assert inputs[0] not in self.outputs, msg
+                self.outputs = [inputs[0] if name == node.outputs[0] else name for name in self.outputs]
+
+            inp_var = node.get_input_variable()
+            out_var = node.get_output_variable()
+
+            # fmt: off
+            assert (np.prod(inp_var.shape) == np.prod(out_var.shape)), \
+                f'Input and output shapes do not match for {node.name}: {inp_var.shape} -> {out_var.shape}'
+            # fmt: on
+
             next_nodes = [x for x in self.graph.values() if node.outputs[0] in x.inputs]
-            if prev_node is not None:
-                if len(next_nodes) > 0:
-                    for next_node in next_nodes:
-                        for i, _ in enumerate(next_node.inputs):
-                            if node.outputs[0] == next_node.inputs[i]:
-                                next_node.inputs[i] = prev_node.outputs[0]
-                                break
-                else:
-                    if not node.outputs[0] in self.outputs:
-                        raise Exception('Cannot rewire a node without child')
-            else:
-                raise Exception('Cannot rewire a node without a parent')
+            for next_node in next_nodes:
+                # Connect inputs -> next
+                for i, nxt_inp in enumerate(next_node.inputs):
+                    if outputs[0] == nxt_inp:
+                        next_node.inputs[i] = inputs[0]
 
         del self.output_vars[node.outputs[0]]
         del self.graph[node.name]
-        self._update_model_outputs()
 
     def replace_node(self, old_node, new_node):
         """Replace an existing node in the graph with a new one.
@@ -625,7 +696,11 @@ class ModelGraph:
                     node.outputs[i] = repl[n]
 
         self.graph = OrderedDict((new_node.name, new_node) if k == old_node.name else (k, v) for k, v in self.graph.items())
-        self._update_model_outputs()
+
+        old_name = old_node.name
+        if old_name in self.outputs:
+            new_name = new_node.name
+            self.outputs = [new_name if name == old_name else name for name in self.outputs]
 
     def split_node(self, old_node, new_node1, new_node2):
         """Replace an existing node in the graph with two nodes in sequence.
@@ -663,17 +738,9 @@ class ModelGraph:
             else:
                 new_graph[key] = value
         self.graph = new_graph
-        self._update_model_outputs()
 
-    def _update_model_outputs(self):
-        '''Update the model outputs
-
-        All node outputs and inputs are found. The model outputs are set to all node outputs
-        that are not also node inputs.
-        '''
-        node_outputs = [out for node in self.graph.values() for out in node.outputs]
-        node_inputs = [inp for node in self.graph.values() for inp in node.inputs]
-        self.outputs = [out for out in node_outputs if out not in node_inputs]
+        if old_node.name in self.outputs:
+            self.outputs = [new_node2.name if name == old_node.name else name for name in self.outputs]
 
     def next_layer(self):
         self.index += 1
@@ -765,7 +832,7 @@ class ModelGraph:
         if x0.dtype in [np.single, np.float32]:
             top_function = getattr(self._top_function_lib, self.config.get_project_name() + '_float')
             ctype = ctypes.c_float
-        elif x0.dtype in [np.double, np.float64, np.float_]:
+        elif x0.dtype in [np.double, np.float64]:
             top_function = getattr(self._top_function_lib, self.config.get_project_name() + '_double')
             ctype = ctypes.c_double
         else:
@@ -805,32 +872,23 @@ class ModelGraph:
         n_inputs = len(self.get_input_variables())
         n_outputs = len(self.get_output_variables())
 
-        curr_dir = os.getcwd()
-        os.chdir(self.config.get_output_dir() + '/firmware')
-
         output = []
         if n_samples == 1 and n_inputs == 1:
             x = [x]
 
-        try:
-            for i in range(n_samples):
-                predictions = [np.zeros(yj.size(), dtype=ctype) for yj in self.get_output_variables()]
-                if n_inputs == 1:
-                    inp = [np.asarray(x[i])]
-                else:
-                    inp = [np.asarray(xj[i]) for xj in x]
-                argtuple = inp
-                argtuple += predictions
-                argtuple = tuple(argtuple)
-                top_function(*argtuple)
-                output.append(predictions)
+        for i in range(n_samples):
+            predictions = [np.zeros(yj.size(), dtype=ctype) for yj in self.get_output_variables()]
+            if n_inputs == 1:
+                inp = [np.asarray(x[i])]
+            else:
+                inp = [np.asarray(xj[i]) for xj in x]
+            inp = [np.ascontiguousarray(_inp) for _inp in inp]
 
-            # Convert to list of numpy arrays (one for each output)
-            output = [
-                np.asarray([output[i_sample][i_output] for i_sample in range(n_samples)]) for i_output in range(n_outputs)
-            ]
-        finally:
-            os.chdir(curr_dir)
+            top_function(*inp, *predictions)
+            output.append(predictions)
+
+        # Convert to list of numpy arrays (one for each output)
+        output = [np.asarray([output[i_sample][i_output] for i_sample in range(n_samples)]) for i_output in range(n_outputs)]
 
         if n_samples == 1 and n_outputs == 1:
             return output[0][0]
@@ -935,3 +993,37 @@ class ModelGraph:
             self.write()
 
         return self.config.backend.build(self, **kwargs)
+
+    def serialize(self):
+        applied_flows = []
+        for flow_group in self._applied_flows:
+            flow_cpy = {}
+            for flow_name, opt_set in flow_group.items():
+                flow_cpy[flow_name] = list(opt_set)
+            applied_flows.append(flow_cpy)
+        state = {
+            'inputs': self.inputs.copy(),
+            'outputs': self.outputs.copy(),
+            'index': self.index,
+            'applied_flows': applied_flows,
+        }
+
+        return state
+
+    @classmethod
+    def deserialize(cls, state):
+        raise Exception(
+            f'{cls.__name__} is not intended to be deserialized directly. Use {cls.__name__}.from_saved_state instead.'
+        )
+
+    def save(self, file_path):
+        """Saves the ModelGraph to a file.
+
+        See `hls4ml.utils.serialization.serialize_model` for details on the file format.
+
+        Args:
+            file_path (str): The path to the file where the model will be saved.
+        """
+        from hls4ml.utils.serialization import serialize_model
+
+        serialize_model(self, file_path)

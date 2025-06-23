@@ -22,7 +22,7 @@ class LinearModel(nn.Module):
         return self.linear(x)
 
 
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_linear(backend, io_type):
     model = LinearModel()
@@ -63,6 +63,7 @@ def test_linear(backend, io_type):
 @pytest.mark.parametrize(
     "activation_function",
     [
+        nn.Softmax(dim=-1),
         nn.ReLU(),
         nn.Tanh(),
         nn.LeakyReLU(negative_slope=1.0),
@@ -72,13 +73,14 @@ def test_linear(backend, io_type):
         nn.Threshold(threshold=1.0, value=0.0),
     ],
 )
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_activations(activation_function, backend, io_type):
     model = torch.nn.Sequential(nn.Linear(1, 1), activation_function).to()
     model.eval()
 
     X_input = np.random.rand(1)
+    X_input = np.round(X_input * 2**10) * 2**-10  # make it an exact ap_fixed<16,6>
 
     pytorch_prediction = model(torch.Tensor(X_input)).detach().numpy()
 
@@ -117,6 +119,14 @@ class ReLuModel(nn.Module):
 
     def forward(self, x):
         return nn.functional.relu(x)
+
+
+class SoftmaxModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return nn.functional.softmax(x, dim=-1)
 
 
 class TanHModel(nn.Module):
@@ -162,6 +172,7 @@ class SigmoidModel(nn.Module):
 @pytest.mark.parametrize(
     "activation_function",
     [
+        SoftmaxModel(),
         ReLuModel(),
         TanHModel(),
         LeakyReLuModel(),
@@ -170,7 +181,7 @@ class SigmoidModel(nn.Module):
         ThresholdModel(),
     ],
 )
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_activation_functionals(activation_function, backend, io_type):
     model = activation_function
@@ -205,7 +216,7 @@ padds_options = [0, 1]
 
 
 @pytest.mark.parametrize('padds', padds_options)
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_conv1d(padds, backend, io_type):
     n_in = 2
@@ -312,7 +323,7 @@ padds_options = [0, 1]
 
 
 @pytest.mark.parametrize('padds', padds_options)
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_conv2d(padds, backend, io_type):
     n_in = 2
@@ -467,7 +478,7 @@ pooling_layers = [MaxPool1d, MaxPool2d, AvgPool1d, AvgPool2d]
 
 @pytest.mark.parametrize('pooling', pooling_layers)
 @pytest.mark.parametrize('padds', padds_options)
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 def test_pooling(pooling, padds, backend):
     assert '1d' in pooling.__name__ or '2d' in pooling.__name__
 
@@ -488,7 +499,7 @@ def test_pooling(pooling, padds, backend):
     model.eval()
     pytorch_prediction = model(torch.Tensor(X_input)).detach().numpy()
 
-    config = config_from_pytorch_model(model, input_shape_forHLS)
+    config = config_from_pytorch_model(model, input_shape_forHLS, transpose_outputs=True)
     output_dir = str(test_root_path / f'hls4mlprj_pytorch_api_pooling_{pooling.__name__}_padds_{padds}_backend_{backend}')
     hls_model = convert_from_pytorch_model(model, hls_config=config, output_dir=output_dir, backend=backend)
     hls_model.compile()
@@ -587,7 +598,7 @@ class BatchNormModel(nn.Module):
         return self.bn(x)
 
 
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_bn(backend, io_type):
     model = BatchNormModel()
@@ -628,7 +639,7 @@ class SqueezeModel(nn.Module):
         return x
 
 
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_squeeze(backend, io_type):
     model = SqueezeModel()
@@ -650,7 +661,8 @@ def test_squeeze(backend, io_type):
 
     np.testing.assert_allclose(hls_prediction, pytorch_prediction, rtol=1e-2, atol=0.01)
 
-    if io_type == 'io_parallel':
+    # oneAPI doesn't use the Repack class (and for io_stream does not use inplace variables)
+    if io_type == 'io_parallel' or backend == 'oneAPI':
         assert list(hls_model.get_layers())[1].attributes['class_name'] == 'Reshape'
         assert list(hls_model.get_layers())[1].attributes['target_shape'] == [1, 5]
         assert list(hls_model.get_layers())[3].attributes['class_name'] == 'Reshape'
@@ -662,7 +674,7 @@ def test_squeeze(backend, io_type):
         assert list(hls_model.get_layers())[3].attributes['target_shape'] == [3]
 
 
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 def test_flatten(backend):
     input = torch.randn(1, 1, 5, 5)
     model = nn.Sequential(nn.Conv2d(1, 32, 5, 1, 1), nn.Flatten(), nn.ReLU())
@@ -706,7 +718,7 @@ class ModelSkippedLayers(nn.Module):
         return x
 
 
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_skipped_layers(backend, io_type):
     model = ModelSkippedLayers()
@@ -739,7 +751,7 @@ def test_skipped_layers(backend, io_type):
     np.testing.assert_allclose(hls_prediction, pytorch_prediction, rtol=0, atol=5e-2)
 
 
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel'])  # Only io_parallel for now
 @pytest.mark.parametrize('tensor_rank', [2, 3])
 def test_remove_transpose(backend, io_type, tensor_rank):
@@ -806,7 +818,7 @@ def test_remove_transpose(backend, io_type, tensor_rank):
     np.testing.assert_allclose(hls_prediction, pytorch_prediction, rtol=0, atol=5e-2)
 
 
-@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus'])
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis', 'Quartus', 'oneAPI'])
 @pytest.mark.parametrize('io_type', ['io_parallel', 'io_stream'])
 def test_view(backend, io_type):
 
@@ -865,3 +877,120 @@ def test_view(backend, io_type):
     rtol = 0
     atol = 5.0e-2
     np.testing.assert_allclose(hls_prediction, pytorch_prediction, rtol=rtol, atol=atol)
+
+
+class EinsumOuterProduct(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, y):
+        return torch.einsum('bi,bj->bij', x, y)
+
+
+class EinsumBatchMatMul(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, y):
+        return torch.einsum('bij,bjk->bik', x, y)
+
+
+class EinsumSingleInput(nn.Module):
+    def __init__(self, input_dim=8):
+        super().__init__()
+        self.input_dim = input_dim
+        self.linear = nn.Linear(self.input_dim, self.input_dim)
+
+    def forward(self, x):
+        """using torch einsum to get the dot product"""
+        out = self.linear(x)
+        return torch.einsum("ij,ij->i", out, out)
+
+
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis'])
+@pytest.mark.parametrize('io_type', ['io_parallel'])
+def test_einsum_outer_product(backend, io_type):
+
+    model = EinsumOuterProduct()
+    model.eval()
+
+    X_input = np.random.rand(3, 4)
+    Y_input = np.random.rand(3, 5)
+
+    pytorch_prediction = model(torch.Tensor(X_input), torch.Tensor(Y_input)).detach().numpy()
+
+    config = config_from_pytorch_model(
+        model,
+        [(None, 4), (None, 5)],
+        default_precision='ap_fixed<16,6>',
+        channels_last_conversion="internal",
+        transpose_outputs=False,
+    )
+    output_dir = str(test_root_path / f'hls4mlprj_pytorch_einsum_outer_product_{backend}_{io_type}')
+
+    hls_model = convert_from_pytorch_model(model, hls_config=config, output_dir=output_dir, backend=backend, io_type=io_type)
+
+    hls_model.compile()
+
+    hls_prediction = np.reshape(hls_model.predict([X_input, Y_input]), pytorch_prediction.shape)
+
+    np.testing.assert_allclose(hls_prediction, pytorch_prediction, rtol=1e-2, atol=0.01)
+
+
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis'])
+@pytest.mark.parametrize('io_type', ['io_parallel'])
+def test_einsum_batch_matmul(backend, io_type):
+
+    model = EinsumBatchMatMul()
+    model.eval()
+
+    X_input = np.random.rand(3, 2, 5)
+    Y_input = np.random.rand(3, 5, 4)
+
+    pytorch_prediction = model(torch.Tensor(X_input), torch.Tensor(Y_input)).detach().numpy()
+
+    config = config_from_pytorch_model(
+        model,
+        [(None, 2, 5), (None, 5, 4)],
+        default_precision='ap_fixed<16,6>',
+        channels_last_conversion="internal",
+        transpose_outputs=False,
+    )
+    output_dir = str(test_root_path / f'hls4mlprj_pytorch_einsum_batch_matmul_{backend}_{io_type}')
+
+    hls_model = convert_from_pytorch_model(model, hls_config=config, output_dir=output_dir, backend=backend, io_type=io_type)
+
+    hls_model.compile()
+
+    hls_prediction = np.reshape(hls_model.predict([X_input, Y_input]), pytorch_prediction.shape)
+
+    np.testing.assert_allclose(hls_prediction, pytorch_prediction, rtol=1e-2, atol=0.01)
+
+
+@pytest.mark.parametrize('backend', ['Vivado', 'Vitis'])
+@pytest.mark.parametrize('io_type', ['io_parallel'])
+def test_einsum_single_input(backend, io_type):
+
+    model = EinsumSingleInput()
+    model.eval()
+
+    X_input = np.random.rand(3, 8)
+
+    pytorch_prediction = model(torch.Tensor(X_input)).detach().numpy()
+
+    config = config_from_pytorch_model(
+        model,
+        [(None, 8)],
+        default_precision='ap_fixed<16,6>',
+        channels_last_conversion="internal",
+        transpose_outputs=False,
+    )
+    output_dir = str(test_root_path / f'hls4mlprj_pytorch_einsum_single_input_{backend}_{io_type}')
+
+    hls_model = convert_from_pytorch_model(model, hls_config=config, output_dir=output_dir, backend=backend, io_type=io_type)
+
+    hls_model.compile()
+
+    hls_prediction = np.reshape(hls_model.predict(X_input), pytorch_prediction.shape)
+
+    np.testing.assert_allclose(hls_prediction, pytorch_prediction, rtol=1e-2, atol=0.01)

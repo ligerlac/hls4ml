@@ -17,6 +17,8 @@ from hls4ml.model.layers import (
     Dense,
     DepthwiseConv1D,
     DepthwiseConv2D,
+    Einsum,
+    EinsumDense,
     Embedding,
     GarNet,
     GarNetStack,
@@ -27,10 +29,13 @@ from hls4ml.model.layers import (
     SeparableConv2D,
     SimpleRNN,
     Softmax,
+    TimeDistributed,
 )
 from hls4ml.model.optimizer import get_backend_passes, layer_optimizer
 from hls4ml.model.types import FixedPrecisionType, IntegerPrecisionType, NamedType, PackedType
 from hls4ml.report import parse_vivado_report
+from hls4ml.utils import attribute_descriptions as descriptions
+from hls4ml.utils.einsum_utils import parse_einsum
 
 
 class VivadoBackend(FPGABackend):
@@ -49,10 +54,12 @@ class VivadoBackend(FPGABackend):
 
         for layer in rnn_layers:
             attrs = self.attribute_map.get(layer, [])
-            attrs.append(ConfigurableAttribute('recurrent_reuse_factor', default=1))
-            attrs.append(ConfigurableAttribute('static', value_type=bool, default=True))
-            attrs.append(ConfigurableAttribute('table_size', default=1024))
-            attrs.append(TypeAttribute('table', default=FixedPrecisionType(18, 8)))
+            attrs.append(ConfigurableAttribute('recurrent_reuse_factor', default=1, description=descriptions.reuse_factor))
+            attrs.append(
+                ConfigurableAttribute('static', value_type=bool, default=True, description=descriptions.recurrent_static)
+            )
+            attrs.append(ConfigurableAttribute('table_size', default=1024, description=descriptions.table_size))
+            attrs.append(TypeAttribute('table', default=FixedPrecisionType(18, 8), description=descriptions.table_type))
             self.attribute_map[layer] = attrs
 
         # Add ParallelizationFactor to Conv1D/2D
@@ -63,23 +70,41 @@ class VivadoBackend(FPGABackend):
 
         for layer in pf_layers:
             attrs = self.attribute_map.get(layer, [])
-            attrs.append(ConfigurableAttribute('parallelization_factor', default=1))
+            attrs.append(ConfigurableAttribute('parallelization_factor', default=1, description=descriptions.conv_pf))
             self.attribute_map[layer] = attrs
 
         # Add ConvImplementation to Convolution+Pooling layers
         cnn_layers = [Conv1D, Conv2D, SeparableConv1D, SeparableConv2D, DepthwiseConv2D, Pooling1D, Pooling2D]
-
         for layer in cnn_layers:
             attrs = self.attribute_map.get(layer, [])
-            # attrs.append(ConfigurableAttribute('conv_implementation', value_type=str, default='LineBuffer'))
-            attrs.append(ChoiceAttribute('conv_implementation', choices=['LineBuffer', 'Encoded'], default='LineBuffer'))
+            attrs.append(
+                ChoiceAttribute(
+                    'conv_implementation',
+                    choices=['LineBuffer', 'Encoded'],
+                    default='LineBuffer',
+                    description=descriptions.conv_implementation,
+                )
+            )
             self.attribute_map[layer] = attrs
+
+        # Add TimeStepLoopParallelism to TimeDistributed
+        attrs = self.attribute_map.get(TimeDistributed, [])
+        attrs.append(
+            ChoiceAttribute(
+                'time_step_loop_parallelism',
+                choices=['Off', 'Unroll', 'Pipeline'],
+                default='Off',
+                description=descriptions.time_distributed_loop,
+            )
+        )
+        self.attribute_map[TimeDistributed] = attrs
 
     def _register_flows(self):
         initializers = self._get_layer_initializers()
         init_flow = register_flow('init_layers', initializers, requires=['optimize'], backend=self.name)
 
         streaming_passes = [
+            'vivado:inplace_stream_flatten',  # Inform downstream changed packsize in case of skipping flatten
             'vivado:reshape_stream',
             'vivado:clone_output',
             'vivado:insert_zero_padding_before_conv1d',
@@ -114,6 +139,9 @@ class VivadoBackend(FPGABackend):
             'vivado:generate_conv_streaming_instructions',
             'vivado:apply_resource_strategy',
             'vivado:generate_conv_im2col',
+            'vivado:generate_pointwise_conv1_d',
+            'vivado:generate_unrolled_dense_resource',
+            'vivado:set_pipeline_style',
         ]
         vivado_types_flow = register_flow('specific_types', vivado_types, requires=[init_flow], backend=self.name)
 
@@ -177,6 +205,7 @@ class VivadoBackend(FPGABackend):
         namespace=None,
         write_weights_txt=True,
         write_tar=False,
+        tb_output_stream='both',
         **_,
     ):
         """Create initial configuration of the Vivado backend.
@@ -191,6 +220,8 @@ class VivadoBackend(FPGABackend):
             write_weights_txt (bool, optional): If True, writes weights to .txt files which speeds up compilation.
                 Defaults to True.
             write_tar (bool, optional): If True, compresses the output directory into a .tar.gz file. Defaults to False.
+            tb_output_stream (str, optional): Controls where to write the output. Options are 'stdout', 'file' and 'both'.
+                Defaults to 'both'.
 
         Returns:
             dict: initial configuration.
@@ -206,6 +237,7 @@ class VivadoBackend(FPGABackend):
             'Namespace': namespace,
             'WriteWeightsTxt': write_weights_txt,
             'WriteTar': write_tar,
+            'TBOutputStream': tb_output_stream,
         }
 
         return config
@@ -244,11 +276,6 @@ class VivadoBackend(FPGABackend):
 
         return parse_vivado_report(model.config.get_output_dir())
 
-    def _validate_conv_strategy(self, layer):
-        if layer.model.config.pipeline_style.lower() != 'dataflow':
-            print(f'WARNING: Layer {layer.name} requires "dataflow" pipeline style. Switching to "dataflow" pipeline style.')
-            layer.model.config.pipeline_style = 'dataflow'
-
     @layer_optimizer(Layer)
     def init_base_layer(self, layer):
         reuse_factor = layer.model.config.get_reuse_factor(layer)
@@ -270,6 +297,22 @@ class VivadoBackend(FPGABackend):
                 index_t = layer.get_weights('weight').type.index_precision
             else:
                 layer.set_attr('strategy', 'resource')
+        elif layer.model.config.get_strategy(layer).lower() == 'resource_unrolled':
+            use_resource_instead = False
+            if layer.get_attr('reuse_factor', 1) == 1:
+                print(
+                    f'Unrolled resource strategy cannot be combined with reuse factor 1 in layer "{layer.name}". '
+                    'Using "resource" strategy instead.'
+                )
+                use_resource_instead = True
+            n_in, n_out = self.get_layer_mult_size(layer)
+            self.set_target_reuse_factor(layer)
+            if use_resource_instead:
+                self.set_closest_reuse_factor(layer, n_in, n_out)
+                layer.set_attr('strategy', 'resource')
+            else:
+                self.set_closest_reuse_factor(layer, n_in, n_out, include_max_rf=False)
+                layer.set_attr('strategy', 'resource_unrolled')
         else:
             layer.set_attr('strategy', 'latency')
         layer.set_attr('index_t', NamedType(f'layer{layer.index}_index', index_t))
@@ -285,6 +328,28 @@ class VivadoBackend(FPGABackend):
             n_in, n_out = self.get_layer_mult_size(layer)
             self.set_target_reuse_factor(layer)
             self.set_closest_reuse_factor(layer, n_in, n_out)
+        elif layer.model.config.get_strategy(layer).lower() == 'resource_unrolled':
+            use_resource_instead = False
+            if layer.get_attr('reuse_factor', 1) == 1:
+                print(
+                    f'Unrolled resource strategy cannot be combined with reuse factor 1 in layer "{layer.name}".'
+                    'Using "resource" strategy instead.'
+                )
+                use_resource_instead = True
+            elif layer.model.config.get_config_value('IOType') == 'io_parallel':
+                print(
+                    f'Unrolled resource strategy cannot be combined with io_parallel in layer "{layer.name}". '
+                    'Using "resource" strategy instead.'
+                )
+                use_resource_instead = True
+            n_in, n_out = self.get_layer_mult_size(layer)
+            self.set_target_reuse_factor(layer)
+            if use_resource_instead:
+                self.set_closest_reuse_factor(layer, n_in, n_out)
+                layer.set_attr('strategy', 'resource')
+            else:
+                self.set_closest_reuse_factor(layer, n_in, n_out, include_max_rf=False)
+                layer.set_attr('strategy', 'resource_unrolled')
         else:
             layer.set_attr('strategy', 'latency')
 
@@ -314,8 +379,6 @@ class VivadoBackend(FPGABackend):
         layer.set_attr('parallelization_factor', closest_pf)
 
         layer.set_attr('implementation', layer.model.config.get_conv_implementation(layer).lower())
-
-        self._validate_conv_strategy(layer)
 
     @layer_optimizer(SeparableConv1D)
     def init_sepconv1d(self, layer):
@@ -386,6 +449,28 @@ class VivadoBackend(FPGABackend):
             self.set_target_reuse_factor(layer)
             n_in, n_out = self.get_layer_mult_size(layer)
             self.set_closest_reuse_factor(layer, n_in, n_out)
+        elif layer.model.config.get_strategy(layer).lower() == 'resource_unrolled':
+            use_resource_instead = False
+            if layer.get_attr('reuse_factor', 1) == 1:
+                print(
+                    f'Unrolled resource strategy cannot be combined with reuse factor 1 in layer "{layer.name}". '
+                    'Using "resource" strategy instead.'
+                )
+                use_resource_instead = True
+            elif layer.model.config.get_config_value('IOType') == 'io_parallel':
+                print(
+                    f'Unrolled resource strategy cannot be combined with io_parallel in layer "{layer.name}". '
+                    'Using "resource" strategy instead.'
+                )
+                use_resource_instead = True
+            n_in, n_out = self.get_layer_mult_size(layer)
+            self.set_target_reuse_factor(layer)
+            if use_resource_instead:
+                self.set_closest_reuse_factor(layer, n_in, n_out)
+                layer.set_attr('strategy', 'resource')
+            else:
+                self.set_closest_reuse_factor(layer, n_in, n_out, include_max_rf=False)
+                layer.set_attr('strategy', 'resource_unrolled')
         else:
             layer.set_attr('strategy', 'latency')
 
@@ -417,8 +502,6 @@ class VivadoBackend(FPGABackend):
 
         layer.set_attr('implementation', layer.model.config.get_conv_implementation(layer).lower())
 
-        self._validate_conv_strategy(layer)
-
     @layer_optimizer(SeparableConv2D)
     def init_sepconv2d(self, layer):
         if layer.model.config.is_resource_strategy(layer):
@@ -441,8 +524,8 @@ class VivadoBackend(FPGABackend):
             )
         else:
             closest_pf = chosen_pf
-        layer.set_attr('n_partitions', out_height * out_width // closest_pf)
 
+        layer.set_attr('n_partitions', out_height * out_width // closest_pf)
         layer.set_attr('implementation', layer.model.config.get_conv_implementation(layer).lower())
 
         # Set the output type of the depthwise phase
@@ -511,6 +594,25 @@ class VivadoBackend(FPGABackend):
             self.set_closest_reuse_factor(layer, n_in, n_out)
             self.set_closest_reuse_factor(layer, n_in_recr, n_out_recr, attribute='recurrent_reuse_factor')
             layer.set_attr('strategy', 'resource')
+        elif layer.model.config.get_strategy(layer).lower() == 'resource_unrolled':
+            use_resource_instead = False
+            if layer.get_attr('reuse_factor', 1) == 1:
+                print(
+                    f'Unrolled resource strategy cannot be combined with reuse factor 1 in layer "{layer.name}". '
+                    'Using "resource" strategy instead.'
+                )
+                use_resource_instead = True
+            n_in, n_out, n_in_recr, n_out_recr = self.get_layer_mult_size(layer)
+            if use_resource_instead:
+                self.set_closest_reuse_factor(layer, n_in, n_out)
+                self.set_closest_reuse_factor(layer, n_in_recr, n_out_recr, attribute='recurrent_reuse_factor')
+                layer.set_attr('strategy', 'resource')
+            else:
+                self.set_closest_reuse_factor(layer, n_in, n_out, include_max_rf=False)
+                self.set_closest_reuse_factor(
+                    layer, n_in_recr, n_out_recr, attribute='recurrent_reuse_factor', include_max_rf=False
+                )
+                layer.set_attr('strategy', 'resource_unrolled')
         else:
             layer.set_attr('strategy', 'latency')
 
@@ -526,10 +628,37 @@ class VivadoBackend(FPGABackend):
             self.set_closest_reuse_factor(layer, n_in, n_out)
             self.set_closest_reuse_factor(layer, n_in_recr, n_out_recr, attribute='recurrent_reuse_factor')
             layer.set_attr('strategy', 'resource')
+        elif layer.model.config.get_strategy(layer).lower() == 'resource_unrolled':
+            use_resource_instead = False
+            if layer.get_attr('reuse_factor', 1) == 1:
+                print(
+                    f'Unrolled resource strategy cannot be combined with reuse factor 1 in layer "{layer.name}". '
+                    'Using "resource" strategy instead.'
+                )
+                use_resource_instead = True
+            n_in, n_out, n_in_recr, n_out_recr = self.get_layer_mult_size(layer)
+            if use_resource_instead:
+                self.set_closest_reuse_factor(layer, n_in, n_out)
+                self.set_closest_reuse_factor(layer, n_in_recr, n_out_recr, attribute='recurrent_reuse_factor')
+                layer.set_attr('strategy', 'resource')
+            else:
+                self.set_closest_reuse_factor(layer, n_in, n_out, include_max_rf=False)
+                self.set_closest_reuse_factor(
+                    layer, n_in_recr, n_out_recr, attribute='recurrent_reuse_factor', include_max_rf=False
+                )
+                layer.set_attr('strategy', 'resource_unrolled')
         else:
             layer.set_attr('strategy', 'latency')
 
         layer.set_attr('index_t', NamedType(f'layer{layer.index}_index', IntegerPrecisionType(width=1, signed=False)))
+
+    @layer_optimizer(TimeDistributed)
+    def init_time_distributed(self, layer):
+        loop_mode = layer.get_attr('time_step_loop_parallelism', 'off').lower()
+        if loop_mode == 'unroll' and layer.model.config.get_config_value('IOType') == 'io_stream':
+            warn(f'Cannot unroll time step loop in layer "{layer.name}" while using "io_stream".')
+            loop_mode = 'off'
+        layer.set_attr('time_step_loop_parallelism', loop_mode)
 
     @layer_optimizer(GarNet)
     def init_garnet(self, layer):
@@ -559,3 +688,108 @@ class VivadoBackend(FPGABackend):
     @layer_optimizer(GarNetStack)
     def init_garnet_stack(self, layer):
         self.init_garnet(layer)
+
+    @layer_optimizer(EinsumDense)
+    def init_einsum_dense(self, layer: EinsumDense) -> None:
+        kernel: np.ndarray = layer.attributes['weight_data']
+        bias: np.ndarray | None = layer.attributes['bias_data']
+        equation = layer.attributes['equation']
+        inp_shape = layer.attributes['inp_shape']
+        out_shape = layer.attributes['out_shape']
+
+        kernel_shape = kernel.shape
+        recipe = parse_einsum(equation, inp_shape, kernel_shape)
+        assert not any(recipe['direct_sum_axis']), (
+            'Do not put direct sum indices (e.g., only appears in one of the operands) in the equation.'
+            'Use explicit addition operator before instead.'
+        )
+        inp_tpose_idxs, ker_tpose_idxs = recipe['in_transpose_idxs']
+        out_tpose_idxs = recipe['out_transpose_idxs']
+
+        # Pre-transpose kernel (and bias) to save a transpose in cpp. Shouldn't matter for latency strategy though.
+        # hls4ml dense acts like i,ij->j
+        # parser assumes ij,j->i, so we need to transpose the kernel to match
+        kernel = kernel.transpose(ker_tpose_idxs)
+        kernel = kernel.reshape(recipe['I'], recipe['L1'], recipe['C']).transpose(0, 2, 1)
+
+        def to_original_kernel(tkernel: np.ndarray) -> np.ndarray:
+            _kernel = tkernel.transpose(0, 2, 1)
+            _kernel = _kernel.reshape(tuple(kernel_shape[i] for i in ker_tpose_idxs))
+            return _kernel.transpose(np.argsort(ker_tpose_idxs))
+
+        # TODO: for weight in bram mode (resource), broadcasting bias here shall be avoided.
+        if bias is not None:
+            bias = np.broadcast_to(bias, out_shape).transpose(np.argsort(out_tpose_idxs))
+        else:
+            # The automatically created bias is just the last dimension of the output shape
+            # Which is too small in general for einsum dense.
+            # The transpose is just to match the shape in case of have real bias, no real effect.
+            bias = np.zeros(out_shape).transpose(np.argsort(out_tpose_idxs))
+
+        layer.attributes['weight_data'] = kernel
+        layer.attributes['to_original_kernel'] = to_original_kernel
+        layer.attributes['bias_data'] = bias
+        layer.attributes['inp_tpose_idxs'] = inp_tpose_idxs
+        layer.attributes['out_tpose_idxs'] = out_tpose_idxs
+        layer.attributes['out_interpert_shape'] = recipe['out_interpert_shape']
+        layer.attributes['n_free_data'] = recipe['L0']
+        layer.attributes['n_free_kernel'] = recipe['L1']
+        layer.attributes['n_inplace'] = recipe['I']
+        layer.attributes['n_contract'] = recipe['C']
+        pf = layer.attributes.get('parallelization_factor', recipe['L0'])
+        layer.attributes['parallelization_factor'] = pf
+
+        layer.add_weights(compression=layer.model.config.get_compression(layer))
+        layer.add_bias()
+
+        strategy: str | None = layer.model.config.get_strategy(layer)
+        if not strategy:
+            layer.set_attr('strategy', 'latency')
+            return
+        if strategy in ('latency', 'resource', 'distributed_arithmetic'):
+            layer.set_attr('strategy', strategy)
+            return
+        warn(f'Invalid strategy "{strategy}" for EinsumDense layer "{layer.name}". Using "latency" strategy instead.')
+        layer.set_attr('strategy', 'latency')
+
+    @layer_optimizer(Einsum)
+    def init_einsum(self, layer: Einsum) -> None:
+
+        equation = layer.attributes['equation']
+        inp0_shape = layer.attributes['inp0_shape']
+        inp1_shape = layer.attributes['inp1_shape']
+
+        recipe = parse_einsum(equation, inp0_shape, inp1_shape)
+        assert not any(recipe['direct_sum_axis']), (
+            'Do not put direct sum indices (e.g., only appears in one of the operands) in the equation.'
+            'Use explicit addition operator before instead.'
+        )
+        inp0_tpose_idxs, inp1_tpose_idxs = recipe['in_transpose_idxs']
+        out_tpose_idxs = recipe['out_transpose_idxs']
+
+        layer.attributes.update(recipe)
+        layer.attributes['n_free0'] = recipe['L0']
+        layer.attributes['n_free1'] = recipe['L1']
+        layer.attributes['n_inplace'] = recipe['I']
+        layer.attributes['n_contract'] = recipe['C']
+        layer.attributes['out_interpert_shape'] = recipe['out_interpert_shape']
+
+        layer.attributes['inp0_tpose_idxs'] = inp0_tpose_idxs
+        layer.attributes['inp1_tpose_idxs'] = inp1_tpose_idxs
+        layer.attributes['out_tpose_idxs'] = out_tpose_idxs
+
+        pf = layer.attributes.get('parallelization_factor', recipe['L0'])
+        layer.attributes['parallelization_factor'] = pf
+
+        strategy: str | None = layer.model.config.get_strategy(layer)
+        if not strategy:
+            layer.set_attr('strategy', 'latency')
+            return
+        if strategy.lower() == 'resource':
+            layer.set_attr('strategy', 'resource')
+            return
+        if strategy.lower() in ('latency', 'distributed_arithmetic'):
+            layer.set_attr('strategy', 'latency')
+            return
+        warn(f'Invalid strategy "{strategy}" for Einsum layer "{layer.name}". Using "latency" strategy instead.')
+        layer.set_attr('strategy', 'latency')

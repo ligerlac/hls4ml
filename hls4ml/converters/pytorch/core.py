@@ -1,4 +1,24 @@
+import numpy as np
+
 from hls4ml.converters.pytorch_to_hls import pytorch_handler
+from hls4ml.utils.einsum_utils import _validate_einsum_expr
+
+
+@pytorch_handler('Constant')
+def parse_constant_layer(operation, layer_name, node):
+    assert 'Constant' in operation
+
+    layer = {}
+    layer['inputs'] = []
+
+    layer['class_name'] = 'Constant'
+    layer['name'] = layer_name
+
+    constant = np.array(node._args)
+    layer['value'] = constant
+    output_shape = constant.shape
+
+    return layer, output_shape
 
 
 @pytorch_handler('Linear')
@@ -55,16 +75,20 @@ def parse_activation_layer(operation, layer_name, input_names, input_shapes, nod
         if layer['class_name'] == 'ELU':
             layer['activ_param'] = class_object.alpha
         if layer['class_name'] == 'PReLU':
-            layer['alpha_data'] = class_object.weight.data.numpy()
+            layer['param_data'] = class_object.weight.data.numpy()
         if layer['class_name'] == 'Threshold':
             layer['activ_param'] = class_object.threshold
             layer['class_name'] = 'ThresholdedReLU'
             layer['activation'] = 'ThresholdedReLU'
             if layer['activ_param'] < 0:
                 raise Exception('negative threshold values not supported')
-
-        if hasattr(node, 'dim'):
+        if hasattr(class_object, 'dim'):
             layer['axis'] = class_object.dim
+            if layer['class_name'] == 'Softmax' and layer['axis'] is None:
+                layer['axis'] = -1
+            if 'IOType' in config:
+                if layer['class_name'] == 'Softmax' and config['IOType'] == 'io_stream' and layer['axis'] != -1:
+                    raise Exception('dim needs to be -1 for io_stream')
     else:
         if layer['class_name'] in ['ReLU', 'Sigmoid', 'Tanh']:
             layer['class_name'] = 'Activation'
@@ -80,6 +104,11 @@ def parse_activation_layer(operation, layer_name, input_names, input_shapes, nod
             layer['activation'] = 'ThresholdedReLU'
         if 'dim' in node.kwargs:
             layer['axis'] = node.kwargs['dim']
+            if layer['class_name'] == 'Softmax' and layer['axis'] is None:
+                layer['axis'] = -1
+            if 'IOType' in config:
+                if layer['class_name'] == 'Softmax' and config['IOType'] == 'io_stream' and layer['axis'] != -1:
+                    raise Exception('dim needs to be -1 for io_stream')
 
     output_shape = input_shapes[0]
     return layer, output_shape
@@ -127,5 +156,34 @@ def parse_batchnorm_layer(operation, layer_name, input_names, input_shapes, node
         layer['n_filt'] = -1
     elif len(input_shapes[0]) > 2:
         layer['n_filt'] = input_shapes[0][1]  # Always channel first for Pytorch
+
+    return layer, [shape for shape in input_shapes[0]]
+
+
+@pytorch_handler('einsum')
+def parse_einsum_layer(operation, layer_name, input_names, input_shapes, node, class_object, data_reader, config):
+    assert 'einsum' in operation
+
+    layer = {}
+
+    if len(input_names) == 1:
+        input_names += input_names
+        input_shapes += input_shapes
+    elif len(input_names) > 2:
+        raise Exception('Only einsum operations with two inputs are supported')
+    layer['class_name'] = 'Einsum'
+    layer['name'] = layer_name
+    layer['inputs'] = input_names
+
+    # Need to set batch size to a real value instead of 'None'. Using '1' as dummy value
+    import copy
+
+    input_shapes_tmp = copy.deepcopy(input_shapes)
+    input_shapes_tmp[0][0] = 1
+    input_shapes_tmp[1][0] = 1
+    layer['inp0_shape'] = tuple(input_shapes_tmp[0])
+    layer['inp1_shape'] = tuple(input_shapes_tmp[1])
+
+    layer['equation'], layer['out_shape'] = _validate_einsum_expr(node.args[0], layer['inp0_shape'], layer['inp1_shape'])
 
     return layer, [shape for shape in input_shapes[0]]
